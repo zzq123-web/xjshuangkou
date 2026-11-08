@@ -1,10 +1,10 @@
 import { classifyBid } from '../game/bid.js';
 import { RANKS } from '../game/deck.js';
-import { callPartner, recordBid } from '../game/engine.js';
+import { bidReturnCount, callPartner, recordBid } from '../game/engine.js';
 import { classifyPlay } from '../game/play/classify.js';
 import { validateFollow } from '../game/play/follow.js';
 import { compareCardValues, isTrump } from '../game/trump.js';
-import { preservesEverySuit } from '../game/tribute.js';
+import { chooseTributeCards, preservesEverySuit } from '../game/tribute.js';
 import type { Card, GameState, PlayerId, Suit } from '../game/types.js';
 
 function exactPairs(cards: readonly Card[]): readonly (readonly [Card, Card])[] {
@@ -145,19 +145,30 @@ export function chooseBotPlay(state: GameState): readonly Card[] {
 }
 
 export function chooseBotExchange(state: GameState): readonly Card[] {
-  const player = state.dealer;
-  const loser = state.pendingExchange[0];
-  const bid = state.bids.find(item => item.player === loser);
+  if (state.phase !== 'exchange' || state.dealer === null || state.trumpSuit === null) throw new Error('人机无法读取还牌信息。');
+  return chooseBotReturn(state.players[state.dealer].hand, bidReturnCount(state), state.trumpSuit);
+}
+
+export function chooseBotTribute(state: GameState): readonly Card[] {
+  const progress = state.tribute;
   const trump = state.trumpSuit;
-  if (state.phase !== 'exchange' || player === null || !bid || trump === null) throw new Error('人机无法读取还牌信息。');
+  if (state.phase !== 'tribute' || !progress || trump === null) throw new Error('当前不能由人机上供或还牌。');
+  const player = state.currentPlayer;
   const hand = state.players[player].hand;
+  if (progress.stage === 'offering') return chooseTributeCards(hand, progress.offerCounts[player], trump);
+  if (progress.stage === 'returning') return chooseBotReturn(hand, progress.receiveCounts[player], trump);
+  throw new Error('上供还牌已经完成。');
+}
+
+export function chooseBotReturn(hand: readonly Card[], count: number, trump: Suit): readonly Card[] {
   const returned: Card[] = [];
-  for (const card of lowestCards(hand, hand.length, trump)) {
-    if (returned.length >= bid.cardCount) break;
+  const ordered = [...hand].sort((a, b) => Number(isTrump(a, trump)) - Number(isTrump(b, trump)) || compareCardValues(a, b, trump));
+  for (const card of ordered) {
+    if (returned.length === count) break;
     const candidate = [...returned, card];
-    if (preservesEverySuit(hand, candidate)) returned.push(card);
+    if (preservesEverySuit(hand, candidate, trump)) returned.push(card);
   }
-  if (returned.length !== bid.cardCount) throw new Error('人机无法选出符合花色规则的还牌。');
+  if (returned.length !== count) throw new Error('人机无法选出符合副牌保留规则的还牌。');
   return returned;
 }
 

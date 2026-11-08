@@ -3,9 +3,9 @@ import { classifyBid } from '../game/bid.js';
 import { createDeck, dealHands } from '../game/deck.js';
 import { createGameState, recordBid } from '../game/engine.js';
 import { validateFollow } from '../game/play/follow.js';
-import { preservesEverySuit } from '../game/tribute.js';
+import { beginInteractiveTribute, preservesEverySuit, submitTributeOffer, submitTributeReturn } from '../game/tribute.js';
 import type { Card, GameState } from '../game/types.js';
-import { chooseBotBid, chooseBotCalledCard, chooseBotExchange, chooseBotPlay } from './bot.js';
+import { chooseBotBid, chooseBotCalledCard, chooseBotExchange, chooseBotPlay, chooseBotReturn, chooseBotTribute } from './bot.js';
 
 function card(suit: Card['suit'], rank: Card['rank'], copy: 1 | 2 = 1): Card {
   const found = createDeck().find(item => item.suit === suit && item.rank === rank && item.copy === copy);
@@ -142,5 +142,28 @@ describe('single-player bot decisions', () => {
     };
 
     expect(chooseBotCalledCard(calling)?.id).toBe(called.id);
+  });
+});
+
+describe('bot interactive exchanges', () => {
+  it('prefers small side cards, retains each side suit, and can fall back to trumps', () => {
+    const hand = [card('clubs', '4'), card('clubs', 'K'), card('spades', 'A'), card('hearts', '4'), card('joker', 'BJ')];
+    const returned = chooseBotReturn(hand, 3, 'hearts');
+    expect(returned).toEqual([hand[0], hand[3], hand[4]]);
+    expect(preservesEverySuit(hand, returned, 'hearts')).toBe(true);
+  });
+
+  it('makes a legal individual choice in each tribute stage', () => {
+    const base = createGameState(dealHands(createDeck()), 0);
+    let state = beginInteractiveTribute({ ...base, phase: 'round-end', dealer: 0, partner: 2, winnerTeam: 0, trumpSuit: 'hearts', scores: [140, 60] }, base.players);
+    const random = Array.from({ length: 107 }, () => 0.6);
+    for (let steps = 0; state.tribute?.stage !== 'complete' && steps < 4; steps++) {
+      const cards = chooseBotTribute(state);
+      state = state.tribute?.stage === 'offering'
+        ? submitTributeOffer(state, state.currentPlayer, cards, random)
+        : submitTributeReturn(state, state.currentPlayer, cards, random);
+    }
+    expect(state.tribute?.stage).toBe('complete');
+    expect(state.players.map(player => player.hand.length)).toEqual([27, 27, 27, 27]);
   });
 });
