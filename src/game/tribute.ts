@@ -1,6 +1,7 @@
-import { isSpecialTrumpRank, trumpStrength } from './trump.js';
+import { isSpecialTrumpRank, isTrump, trumpStrength } from './trump.js';
+import { shuffleCards } from './deck.js';
 import { teamOf } from './score.js';
-import type { Card, GameState, PlayerId, Suit, TributeExchangeSummary } from './types.js';
+import type { Card, GameEvent, GameState, PlayerId, SeatValues, Suit, TributeExchangeSummary, TributeProgress } from './types.js';
 
 export type TributeExchange = TributeExchangeSummary;
 
@@ -71,13 +72,14 @@ export function chooseTributeCards(hand: readonly Card[], requested: number, tru
   return selected;
 }
 
-export function preservesEverySuit(hand: readonly Card[], returned: readonly Card[]): boolean {
+export function preservesEverySuit(hand: readonly Card[], returned: readonly Card[], trumpSuit?: Suit): boolean {
   const returnedIds = new Set(returned.map(card => card.id));
   if (returnedIds.size !== returned.length) return false;
   const handIds = new Set(hand.map(card => card.id));
   if (returned.some(card => !handIds.has(card.id))) return false;
-  const before = suitCounts(hand);
-  const after = suitCounts(hand.filter(card => !returnedIds.has(card.id)));
+  const sideCards = trumpSuit ? hand.filter(card => !isTrump(card, trumpSuit)) : hand;
+  const before = suitCounts(sideCards);
+  const after = suitCounts(sideCards.filter(card => !returnedIds.has(card.id)));
   return [...before.entries()].every(([suit, count]) => count === 0 || (after.get(suit) ?? 0) > 0);
 }
 
@@ -145,4 +147,138 @@ function removeCards(hand: Card[], cards: readonly Card[]): void {
 
 function clockwiseDistance(player: PlayerId, from: PlayerId): number {
   return (player - from + 4) % 4;
+}
+
+/** Start the next deal without moving any player's chosen cards automatically. */
+export function beginInteractiveTribute(state: GameState, dealtPlayers: GameState['players']): GameState {
+  if (state.phase !== 'round-end') throw new Error('本局结束后才能开始上供。');
+  assertCompleteDeal(dealtPlayers);
+  const dealer = state.dealer ?? state.previousDealer;
+  const validTeams = state.dealer !== null && state.partner !== null && state.winnerTeam !== null && state.trumpSuit !== null;
+  const dealerTeam: readonly [PlayerId, PlayerId] = validTeams ? [state.dealer!, state.partner!] : [0, 2];
+  const others = ([0, 1, 2, 3] as const).filter(id => !dealerTeam.includes(id));
+  const otherTeam: readonly [PlayerId, PlayerId] = [others[0], others[1]];
+  const winners = state.winnerTeam === 1 ? otherTeam : dealerTeam;
+  const losers = state.winnerTeam === 1 ? dealerTeam : otherTeam;
+  const requested = validTeams ? supplyCount(Math.abs(state.scores[0] - state.scores[1])) : 0;
+  const antiSupply = requested === 8 && state.trumpSuit !== null
+    && teamCanAntiSupply({ ...state, players: dealtPlayers }, losers, state.trumpSuit);
+  const quotas = splitTeamQuota(antiSupply ? 0 : requested, losers, dealer);
+  const offerCounts: [number, number, number, number] = [0, 0, 0, 0];
+  losers.forEach((id, index) => {
+    offerCounts[id] = state.trumpSuit ? chooseTributeCards(dealtPlayers[id].hand, quotas[index], state.trumpSuit).length : 0;
+  });
+  const offers: [readonly Card[] | null, readonly Card[] | null, readonly Card[] | null, readonly Card[] | null] = [[], [], [], []];
+  for (const id of losers) if (offerCounts[id] > 0) offers[id] = null;
+  const first = losers.find(id => offers[id] === null);
+  const tribute: TributeProgress = {
+    stage: first === undefined ? 'complete' : 'offering', winners, losers, offerCounts,
+    receiveCounts: [0, 0, 0, 0], offers, returns: [[], [], [], []], antiSupply
+  };
+  return {
+    ...state, players: dealtPlayers, phase: 'tribute', tribute, tributeExchanges: [],
+    fullSupply: requested === 8 && !antiSupply, previousLosingTeam: requested === 8 && !antiSupply ? losers : null,
+    currentPlayer: first ?? dealer, previousDealer: dealer, roundNumber: (state.roundNumber ?? 1) + 1,
+    currentTrick: [], lead: null, trickLeader: null, calledCard: null, bids: [], pendingExchange: []
+  };
+}
+
+export function validateTributeSelection(hand: readonly Card[], selected: readonly Card[], count: number, trump: Suit): void {
+  if (!containsCards(hand, selected)) throw new Error('只能选择自己手中的牌，同一张牌不能重复选择。');
+  const expected = chooseTributeCards(hand, count, trump);
+  if (selected.length !== expected.length) throw new Error(`应上供${expected.length}张。`);
+  if (selected.some(card => card.suit !== 'joker' && !isSpecialTrumpRank(card.rank))) throw new Error('只能上供2、3、5和大小王。');
+  for (const pair of exactPairs(hand)) {
+    const picked = pair.filter(card => selected.some(item => item.id === card.id)).length;
+    if (picked === 1) throw new Error('上供不能拆对子。');
+  }
+  const strengths = (cards: readonly Card[]) => cards.map(card => trumpStrength(card, trump)).sort((a, b) => b - a);
+  if (strengths(selected).some((value, index) => value !== strengths(expected)[index])) throw new Error('上供必须优先选择最大的合格牌。');
+}
+
+export function submitTributeOffer(state: GameState, player: PlayerId, cards: readonly Card[], randomValues: readonly number[]): GameState {
+  const progress = requireTributeTurn(state, player, 'offering');
+  if (state.trumpSuit === null) throw new Error('上供缺少上一局主花色。');
+  const hand = state.players[player].hand;
+  validateTributeSelection(hand, cards, progress.offerCounts[player], state.trumpSuit);
+  const players = mutablePlayers(state);
+  players[player] = { ...players[player], hand: withoutCards(hand, cards) };
+  const offers = replaceSeat(progress.offers, player, [...cards]);
+  let next: GameState = { ...state, players, tribute: { ...progress, offers } };
+  next = recordCardEvent(next, 'tribute-offer', player, cards);
+  const pending = progress.losers.find(id => offers[id] === null);
+  if (pending !== undefined) return { ...next, currentPlayer: pending };
+
+  const pool = shuffleCards(offers.flatMap(value => value ?? []), randomValues);
+  const quotas = splitTeamQuota(pool.length, progress.winners, state.previousDealer);
+  const receiveCounts: [number, number, number, number] = [0, 0, 0, 0];
+  let cursor = 0;
+  for (const [index, id] of progress.winners.entries()) {
+    const received = pool.slice(cursor, cursor + quotas[index]);
+    cursor += received.length;
+    receiveCounts[id] = received.length;
+    players[id] = { ...players[id], hand: [...players[id].hand, ...received] };
+    if (received.length) next = recordCardEvent(next, 'tribute-receive', id, received);
+  }
+  const returns: [readonly Card[] | null, readonly Card[] | null, readonly Card[] | null, readonly Card[] | null] = [[], [], [], []];
+  for (const id of progress.winners) if (receiveCounts[id]) returns[id] = null;
+  const first = progress.winners.find(id => returns[id] === null);
+  return { ...next, players, currentPlayer: first ?? state.previousDealer,
+    tribute: { ...progress, offers, receiveCounts, returns, stage: first === undefined ? 'complete' : 'returning' } };
+}
+
+export function submitTributeReturn(state: GameState, player: PlayerId, cards: readonly Card[], randomValues: readonly number[]): GameState {
+  const progress = requireTributeTurn(state, player, 'returning');
+  if (state.trumpSuit === null) throw new Error('还牌缺少上一局主花色。');
+  const hand = state.players[player].hand;
+  if (cards.length !== progress.receiveCounts[player]) throw new Error(`应还${progress.receiveCounts[player]}张牌。`);
+  if (!preservesEverySuit(hand, cards, state.trumpSuit)) throw new Error('请选择自己的牌，还牌不能还绝任何一门副牌。');
+  const players = mutablePlayers(state);
+  players[player] = { ...players[player], hand: withoutCards(hand, cards) };
+  const returns = replaceSeat(progress.returns, player, [...cards]);
+  let next: GameState = { ...state, players, tribute: { ...progress, returns } };
+  next = recordCardEvent(next, 'tribute-return', player, cards);
+  const pending = progress.winners.find(id => returns[id] === null);
+  if (pending !== undefined) return { ...next, currentPlayer: pending };
+  const pool = shuffleCards(returns.flatMap(value => value ?? []), randomValues);
+  let cursor = 0;
+  for (const id of progress.losers) {
+    const received = pool.slice(cursor, cursor + progress.offerCounts[id]);
+    cursor += received.length;
+    players[id] = { ...players[id], hand: [...players[id].hand, ...received] };
+    if (received.length) next = recordCardEvent(next, 'return-receive', id, received);
+  }
+  assertCompleteDeal(players);
+  return { ...next, players, currentPlayer: state.previousDealer, tribute: { ...progress, returns, stage: 'complete' } };
+}
+
+export function recordCardEvent(state: GameState, kind: GameEvent['kind'], player: PlayerId, cards: readonly Card[]): GameState {
+  const event: GameEvent = { round: state.roundNumber ?? 1, kind, player, cards: [...cards], viewer: kind === 'play' ? null : player };
+  return { ...state, events: [...(state.events ?? []), event].slice(-500) };
+}
+
+function requireTributeTurn(state: GameState, player: PlayerId, stage: TributeProgress['stage']): TributeProgress {
+  const progress = state.tribute;
+  if (state.phase !== 'tribute' || !progress || progress.stage !== stage || state.currentPlayer !== player) throw new Error('当前还没有轮到你上供或还牌。');
+  return progress;
+}
+
+function mutablePlayers(state: GameState): [GameState['players'][0], GameState['players'][1], GameState['players'][2], GameState['players'][3]] {
+  return [state.players[0], state.players[1], state.players[2], state.players[3]];
+}
+
+function replaceSeat<T>(values: SeatValues<T>, player: PlayerId, value: T): SeatValues<T> {
+  const result: [T, T, T, T] = [values[0], values[1], values[2], values[3]];
+  result[player] = value;
+  return result;
+}
+
+function withoutCards(hand: readonly Card[], cards: readonly Card[]): readonly Card[] {
+  const ids = new Set(cards.map(card => card.id));
+  return hand.filter(card => !ids.has(card.id));
+}
+
+function assertCompleteDeal(players: GameState['players']): void {
+  const cards = players.flatMap(player => player.hand);
+  if (players.some(player => player.hand.length !== 27) || new Set(cards.map(card => card.id)).size !== 108) throw new Error('换牌后必须每人27张，且108张牌没有重复或丢失。');
 }
