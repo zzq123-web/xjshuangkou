@@ -1,9 +1,10 @@
 import { classifyBid, hasAnyBidCandidate, resolveWinningBid } from './bid.js';
 import type { Hands } from './deck.js';
+import { shuffleCards } from './deck.js';
 import { compareTrickPlays } from './play/compare.js';
 import { validateFollow } from './play/follow.js';
 import { awardTrick } from './score.js';
-import { preservesEverySuit } from './tribute.js';
+import { preservesEverySuit, recordCardEvent } from './tribute.js';
 import type { Bid, Card, GameState, Play, PlayerId, Suit } from './types.js';
 
 export interface PriorRoundRules {
@@ -18,6 +19,7 @@ export function createGameState(hands: Hands, previousDealer: PlayerId, priorRul
     { id: 2, hand: hands[2] }, { id: 3, hand: hands[3] }
   ];
   return {
+    tribute: null, events: [], roundNumber: 1, bidExchangeCollected: false,
     phase: 'bidding', players, dealer: null, previousDealer,
     previousLosingTeam: priorRules.previousLosingTeam ?? null,
     fullSupply: priorRules.fullSupply ?? false,
@@ -79,45 +81,70 @@ export function resolveBidding(state: GameState): GameState {
   const trumpSuit = winning.cards[0].suit;
   if (trumpSuit === 'joker') throw new Error('Jokers cannot establish the trump suit.');
   const pendingExchange = state.bids.filter(bid => bid.player !== winning.player).map(bid => bid.player);
-  return {
+  const resolved: GameState = {
     ...state,
     phase: pendingExchange.length ? 'exchange' : 'partner-call',
     bidsRevealed: true,
     dealer: winning.player,
     currentPlayer: winning.player,
     trumpSuit: trumpSuit as Suit,
-    pendingExchange
+    pendingExchange, bidExchangeCollected: false
   };
+  return pendingExchange.length ? collectBidCards(resolved) : resolved;
 }
 
 export function revealedBids(state: GameState): readonly Bid[] {
   return state.bidsRevealed ? state.bids : [];
 }
 
-export function exchangeBidCards(state: GameState, returned: readonly Card[]): GameState {
-  if (state.phase !== 'exchange' || state.dealer === null) throw new Error('There is no bid exchange to complete.');
-  const loser = state.pendingExchange[0];
-  if (loser === undefined) throw new Error('No losing caller is waiting for an exchange.');
-  const losingBid = state.bids.find(bid => bid.player === loser);
-  if (!losingBid) throw new Error('The losing caller has no recorded bid.');
-  const dealerHand = state.players[state.dealer].hand;
-  const loserHand = state.players[loser].hand;
-  if (returned.length !== losingBid.cards.length) throw new Error('Return the same number of cards as the exposed bid.');
-  const incomingDealerHand = [...dealerHand, ...losingBid.cards];
-  if (returned.length !== losingBid.cards.length || !containsCards(incomingDealerHand, returned)) {
-    throw new Error('Return the same number of cards after collecting the exposed bid.');
-  }
-  if (!preservesEverySuit(incomingDealerHand, returned)) throw new Error('A return cannot leave a suit empty.');
-  if (!containsCards(loserHand, losingBid.cards)) throw new Error('The losing caller no longer holds the exposed bid cards.');
-
+export function collectBidCards(state: GameState): GameState {
+  if (state.phase !== 'exchange' || state.dealer === null || state.bidExchangeCollected) return state;
   const players = copyPlayers(state);
-  players[loser] = { ...players[loser], hand: removeCards(loserHand, losingBid.cards).concat(returned) };
-  players[state.dealer] = { ...players[state.dealer], hand: removeCards(incomingDealerHand, returned) };
-  const pendingExchange = state.pendingExchange.slice(1);
-  return {
-    ...state, players, pendingExchange,
-    phase: pendingExchange.length ? 'exchange' : 'partner-call'
-  };
+  const incoming: Card[] = [];
+  for (const id of state.pendingExchange) {
+    const bid = state.bids.find(item => item.player === id);
+    if (!bid || !containsCards(players[id].hand, bid.cards)) throw new Error('争庄牌不在玩家手中。');
+    players[id] = { ...players[id], hand: removeCards(players[id].hand, bid.cards) };
+    incoming.push(...bid.cards);
+  }
+  players[state.dealer] = { ...players[state.dealer], hand: [...players[state.dealer].hand, ...incoming] };
+  return recordCardEvent({ ...state, players, bidExchangeCollected: true }, 'bid-receive', state.dealer, incoming);
+}
+
+export function bidReturnCount(state: GameState): number {
+  return state.bids.filter(bid => state.pendingExchange.includes(bid.player)).reduce((total, bid) => total + bid.cards.length, 0);
+}
+
+export function exchangeBidCards(state: GameState, returned: readonly Card[], randomValues: readonly number[] = []): GameState {
+  state = collectBidCards(state);
+  if (state.phase !== 'exchange' || state.dealer === null || state.trumpSuit === null) throw new Error('当前没有需要完成的争庄还牌。');
+  const count = bidReturnCount(state);
+  if (!count || returned.length !== count) throw new Error(`请一次选齐${count}张还牌。`);
+  const hand = state.players[state.dealer].hand;
+  if (!preservesEverySuit(hand, returned, state.trumpSuit)) throw new Error('请选择自己的牌，还牌不能还绝任何一门副牌。');
+  const pool = shuffleCards(returned, randomValues);
+  const players = copyPlayers(state);
+  players[state.dealer] = { ...players[state.dealer], hand: removeCards(hand, returned) };
+  let next = recordCardEvent(state, 'bid-return', state.dealer, returned);
+  let cursor = 0;
+  for (const id of state.pendingExchange) {
+    const bid = state.bids.find(item => item.player === id);
+    if (!bid) throw new Error('缺少争庄记录。');
+    const received = pool.slice(cursor, cursor + bid.cards.length);
+    cursor += received.length;
+    players[id] = { ...players[id], hand: [...players[id].hand, ...received] };
+    next = recordCardEvent(next, 'bid-receive', id, received);
+  }
+  return { ...next, players, pendingExchange: [], phase: 'partner-call' };
+}
+
+export function resumeAfterTribute(state: GameState): GameState {
+  if (state.phase !== 'tribute' || (state.tribute && state.tribute.stage !== 'complete')) throw new Error('请先完成所有上供和还牌。');
+  const hands: Hands = [state.players[0].hand, state.players[1].hand, state.players[2].hand, state.players[3].hand];
+  if (hands.some(hand => hand.length !== 27)) throw new Error('每人必须恢复27张牌后才能开局。');
+  return { ...createGameState(hands, state.dealer ?? state.previousDealer, {
+    fullSupply: state.fullSupply, previousLosingTeam: state.previousLosingTeam
+  }), events: state.events ?? [], roundNumber: state.roundNumber ?? 1 };
 }
 
 export function callPartner(state: GameState, called: Card): GameState {
@@ -147,6 +174,8 @@ export function playTurn(state: GameState, player: PlayerId, cards: readonly Car
   const hand = state.players[player].hand;
   const validation = validateFollow(hand, cards, state.lead, state.trumpSuit);
   if (!validation.legal) throw new Error(validation.reason ?? 'Illegal play.');
+
+  state = recordCardEvent(state, 'play', player, cards);
 
   const play: Play = { player, cards: [...cards] };
   const players = copyPlayers(state);
