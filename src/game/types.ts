@@ -48,7 +48,34 @@ export interface TributeExchangeSummary {
   readonly returned: readonly Card[];
 }
 
+export type SeatValues<T> = readonly [T, T, T, T];
+
+export interface TributeProgress {
+  readonly stage: 'offering' | 'returning' | 'complete';
+  readonly winners: readonly [PlayerId, PlayerId];
+  readonly losers: readonly [PlayerId, PlayerId];
+  readonly offerCounts: SeatValues<number>;
+  readonly receiveCounts: SeatValues<number>;
+  readonly offers: SeatValues<readonly Card[] | null>;
+  readonly returns: SeatValues<readonly Card[] | null>;
+  readonly antiSupply: boolean;
+}
+
+export interface GameEvent {
+  readonly round: number;
+  readonly kind: 'tribute-offer' | 'tribute-receive' | 'tribute-return' | 'return-receive' | 'bid-return' | 'bid-receive' | 'play';
+  readonly player: PlayerId;
+  readonly cards: readonly Card[];
+  /** null means public; private events are delivered only to this seat. */
+  readonly viewer: PlayerId | null;
+}
+
 export interface GameState {
+  /** Optional for compatibility with rooms saved before interactive exchanges. */
+  readonly tribute?: TributeProgress | null;
+  readonly events?: readonly GameEvent[];
+  readonly roundNumber?: number;
+  readonly bidExchangeCollected?: boolean;
   readonly phase: GamePhase;
   readonly players: readonly [PlayerState, PlayerState, PlayerState, PlayerState];
   readonly dealer: PlayerId | null;
