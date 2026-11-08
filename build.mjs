@@ -1,5 +1,5 @@
 import { stripTypeScriptTypes } from 'node:module';
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { relative, resolve, sep } from 'node:path';
 
 const projectRoot = process.cwd();
@@ -12,12 +12,16 @@ await mkdir(outputRoot, { recursive: true });
 await visit(sourceRoot);
 const serverOutput = resolve(outputRoot, 'server');
 await mkdir(serverOutput, { recursive: true });
+await cp(resolve(outputRoot, 'game'), resolve(serverOutput, 'game'), { recursive: true });
+await cp(resolve(outputRoot, 'ui'), resolve(serverOutput, 'ui'), { recursive: true });
 const page = await readFile(resolve(projectRoot, 'index.html'), 'utf8');
 await writeFile(resolve(serverOutput, 'page.js'), `export default ${JSON.stringify(page)};\n`, 'utf8');
 const assets = {};
 await collectAssets(outputRoot);
 await writeFile(resolve(serverOutput, 'assets.js'), `export const assets = ${JSON.stringify(assets)};\n`, 'utf8');
-await writeFile(resolve(serverOutput, 'index.js'), await readFile(resolve(serverOutput, 'worker.js'), 'utf8'), 'utf8');
+const workerSource = await readFile(resolve(serverOutput, 'worker.js'), 'utf8');
+await writeFile(resolve(serverOutput, 'index.js'), workerSource.replaceAll("'../game/", "'./game/"), 'utf8');
+await rm(resolve(serverOutput, 'worker.js'));
 await mkdir(resolve(outputRoot, '.openai'), { recursive: true });
 await writeFile(resolve(outputRoot, '.openai/hosting.json'), await readFile(resolve(projectRoot, '.openai/hosting.json'), 'utf8'), 'utf8');
 process.stdout.write(`Built ${built} TypeScript modules into dist/.\n`);
