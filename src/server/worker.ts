@@ -1,7 +1,7 @@
 import { createDeck, dealHands, shuffleCards } from '../game/deck.js';
-import type { Hands } from '../game/deck.js';
-import { callPartner, createGameState, exchangeBidCards, passBid, playTurn, recordBid, resolveBidding } from '../game/engine.js';
-import { beginTributePhase, chooseTributeCards, preservesEverySuit, splitTeamQuota, supplyCount, teamCanAntiSupply } from '../game/tribute.js';
+import { callPartner, collectBidCards, createGameState, exchangeBidCards, passBid, playTurn, recordBid, resolveBidding, resumeAfterTribute } from '../game/engine.js';
+import { beginInteractiveTribute, submitTributeOffer, submitTributeReturn } from '../game/tribute.js';
+import { gameForPlayer } from '../game/view.js';
 import type { Card, GameState, PlayerId } from '../game/types.js';
 import page from './page.js';
 import { assets } from './assets.js';
@@ -56,19 +56,6 @@ interface ApiBody {
   readonly cardIds?: unknown;
 }
 
-interface TributeSlot {
-  readonly loser: PlayerId;
-  readonly card: Card;
-}
-
-interface ExchangeBuild {
-  readonly from: PlayerId;
-  readonly to: PlayerId;
-  readonly offered: Card[];
-  readonly returned: Card[];
-}
-
-const playerIds: readonly PlayerId[] = [0, 1, 2, 3];
 const roomCodeCharacters = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 class HttpError extends Error {
@@ -90,16 +77,6 @@ function deal() {
   return dealHands(shuffleCards(createDeck(), randomValues(107)));
 }
 
-function shuffleArray<T>(items: readonly T[]): T[] {
-  const shuffled = [...items];
-  const values = randomValues(Math.max(0, shuffled.length - 1));
-  for (let index = shuffled.length - 1, step = 0; index > 0; index -= 1, step += 1) {
-    const swapIndex = Math.floor(values[step] * (index + 1));
-    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
-  }
-  return shuffled;
-}
-
 function cleanName(value: unknown): string {
   const name = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, 16) : '';
   return name || '玩家';
@@ -116,30 +93,8 @@ function publicPlayers(room: Room) {
     : { id, name: `等待玩家${id + 1}`, ready: false });
 }
 
-function hiddenCards(count: number, playerId: PlayerId): Card[] {
-  return Array.from({ length: count }, (_, index) => ({
-    id: `hidden-${playerId}-${index}`,
-    suit: 'clubs',
-    rank: '4',
-    copy: index % 2 === 0 ? 1 : 2
-  }));
-}
-
 function roomSnapshot(room: Room, playerId: PlayerId, requestUrl: string) {
-  let game: GameState | null = null;
-  if (room.game) {
-    const players = room.game.players.map(player => ({
-      ...player,
-      hand: player.id === playerId || room.game?.phase === 'round-end'
-        ? player.hand
-        : hiddenCards(player.hand.length, player.id)
-    }));
-    game = {
-      ...room.game,
-      bids: room.game.bidsRevealed ? room.game.bids : [],
-      players: [players[0], players[1], players[2], players[3]]
-    };
-  }
+  const game = room.game ? gameForPlayer(room.game, playerId) : null;
   const invite = new URL(`/?room=${room.code}`, requestUrl);
   return {
     code: room.code,
@@ -203,7 +158,9 @@ async function readJson(request: Request): Promise<ApiBody> {
 async function getRoom(db: D1Database, code: string): Promise<Room> {
   const row = await db.prepare('SELECT data FROM rooms WHERE code = ?').bind(code.toUpperCase()).first<RoomRow>();
   if (!row) throw new HttpError(404, '没有找到这个房间，请检查房间号。');
-  return JSON.parse(row.data) as Room;
+  const room = JSON.parse(row.data) as Room;
+  if (room.game?.phase === 'exchange') room.game = collectBidCards(room.game);
+  return room;
 }
 
 async function saveRoom(db: D1Database, room: Room, expectedVersion: number): Promise<boolean> {
@@ -257,91 +214,8 @@ function advanceBidding(room: Room, next: GameState, playerId: PlayerId): { game
   return { game: resolved, message: `争庄揭晓，${roomPlayerName(room, resolved.dealer)}成为庄家。` };
 }
 
-function randomReturnCards(hand: readonly Card[], count: number): readonly Card[] {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    const shuffled = shuffleCards(hand, randomValues(Math.max(0, hand.length - 1)));
-    const candidate = shuffled.slice(0, count);
-    if (preservesEverySuit(hand, candidate)) return candidate;
-  }
-  throw new Error('无法随机选出符合花色保留规则的还牌。');
-}
-
-function beginNextRoundTribute(game: GameState): { game: GameState; message: string } {
-  if (game.winnerTeam === null || game.dealer === null || game.partner === null || game.trumpSuit === null) {
-    const previousDealer = game.dealer ?? game.previousDealer;
-    const freshState = createGameState(deal(), previousDealer);
-    const tributeState = beginTributePhase({ ...game, fullSupply: false, previousLosingTeam: null }, freshState.players, []);
-    return { game: tributeState, message: '本轮无需上供，请查看明细后开始下一局。' };
-  }
-  const previousDealer = game.dealer;
-  const otherPlayers = playerIds.filter(id => id !== game.dealer && id !== game.partner) as [PlayerId, PlayerId];
-  const winningTeam: readonly [PlayerId, PlayerId] = game.winnerTeam === 0 ? [game.dealer, game.partner] : otherPlayers;
-  const losingTeam: readonly [PlayerId, PlayerId] = game.winnerTeam === 0 ? otherPlayers : [game.dealer, game.partner];
-  const requested = supplyCount(Math.abs(game.scores[0] - game.scores[1]));
-  const newHands = deal();
-  const temporaryPlayers: GameState['players'] = [
-    { id: 0, hand: newHands[0] },
-    { id: 1, hand: newHands[1] },
-    { id: 2, hand: newHands[2] },
-    { id: 3, hand: newHands[3] }
-  ];
-  const dealState: GameState = { ...game, phase: 'dealing', players: temporaryPlayers };
-  let message = requested === 0 ? '净胜不足20分，本轮不上供。' : `按净胜分计算上${requested}供。`;
-  const antiSupply = requested === 8 && teamCanAntiSupply(dealState, losingTeam, game.trumpSuit);
-  const fullSupply = requested === 8 && !antiSupply;
-  let tributeExchanges: GameState['tributeExchanges'] = [];
-  if (antiSupply) {
-    message = '输家成功抗满供，本轮不上供。';
-  } else if (requested > 0) {
-    const loserQuotas = splitTeamQuota(requested, losingTeam, previousDealer);
-    const offers = new Map<PlayerId, readonly Card[]>([
-      [losingTeam[0], chooseTributeCards(dealState.players[losingTeam[0]].hand, loserQuotas[0], game.trumpSuit)],
-      [losingTeam[1], chooseTributeCards(dealState.players[losingTeam[1]].hand, loserQuotas[1], game.trumpSuit)]
-    ]);
-    const slots: TributeSlot[] = shuffleArray(losingTeam.flatMap(loser => (offers.get(loser) ?? []).map(card => ({ loser, card }))));
-    if (slots.length) {
-      const winnerQuotas = splitTeamQuota(slots.length, winningTeam, previousDealer);
-      const winnerSlots = new Map<PlayerId, TributeSlot[]>([[winningTeam[0], []], [winningTeam[1], []]]);
-      let cursor = 0;
-      for (const winner of winningTeam) {
-        const quota = winner === winningTeam[0] ? winnerQuotas[0] : winnerQuotas[1];
-        winnerSlots.set(winner, slots.slice(cursor, cursor + quota));
-        cursor += quota;
-      }
-      const exchanges = new Map<string, ExchangeBuild>();
-      for (const winner of winningTeam) {
-        const received = winnerSlots.get(winner) ?? [];
-        const returned = randomReturnCards(dealState.players[winner].hand, received.length);
-        received.forEach((slot, index) => {
-          const key = `${slot.loser}:${winner}`;
-          const exchange = exchanges.get(key) ?? { from: slot.loser, to: winner, offered: [], returned: [] };
-          exchange.offered.push(slot.card);
-          const returnCard = returned[index];
-          if (returnCard) exchange.returned.push(returnCard);
-          exchanges.set(key, exchange);
-        });
-      }
-      tributeExchanges = [...exchanges.values()];
-      message = `已完成${slots.length}供：输家上牌，赢家分供并还牌。请查看明细。`;
-    } else {
-      message = '输家没有足够的合格主牌，本轮未能上供。';
-    }
-  }
-  const tributeState = beginTributePhase(
-    { ...game, fullSupply, previousLosingTeam: fullSupply ? losingTeam : null },
-    temporaryPlayers,
-    tributeExchanges
-  );
-  return { game: tributeState, message };
-}
-
-function continueAfterTribute(game: GameState): GameState {
-  if (game.phase !== 'tribute') throw new HttpError(409, '当前没有待确认的上供结果。');
-  const hands: Hands = [game.players[0].hand, game.players[1].hand, game.players[2].hand, game.players[3].hand];
-  return createGameState(hands, game.dealer ?? game.previousDealer, {
-    fullSupply: game.fullSupply,
-    previousLosingTeam: game.previousLosingTeam
-  });
+function finishTribute(game: GameState): GameState {
+  return game.phase === 'tribute' && game.tribute?.stage === 'complete' ? resumeAfterTribute(game) : game;
 }
 
 function applyAction(room: Room, playerId: PlayerId, body: ApiBody): void {
@@ -350,14 +224,14 @@ function applyAction(room: Room, playerId: PlayerId, body: ApiBody): void {
   const action = body.action;
   if (action === 'next') {
     if (playerId !== room.hostId || game.phase !== 'round-end') throw new HttpError(403, '只有房主可以开始下一局。');
-    const result = beginNextRoundTribute(game);
-    room.game = result.game;
-    bumpRoom(room, result.message);
+    const dealtPlayers = createGameState(deal(), game.dealer ?? game.previousDealer).players;
+    room.game = finishTribute(beginInteractiveTribute(game, dealtPlayers));
+    bumpRoom(room, room.game.phase === 'tribute' ? '新牌已发，等待输家选择供牌。' : '本轮无需上供，开始新一局。');
     return;
   }
   if (action === 'continue-next') {
     if (playerId !== room.hostId || game.phase !== 'tribute') throw new HttpError(403, '只有房主可以确认上供结果。');
-    room.game = continueAfterTribute(game);
+    room.game = resumeAfterTribute(game);
     bumpRoom(room, '上供还牌确认完成，新一局已发牌。');
     return;
   }
@@ -386,8 +260,14 @@ function applyAction(room: Room, playerId: PlayerId, body: ApiBody): void {
       next = result.game;
       message = result.message;
     } else message = `${roomPlayerName(room, playerId)}选择不争庄。`;
+  } else if (action === 'tribute-offer') {
+    next = finishTribute(submitTributeOffer(game, playerId, cards, randomValues(107)));
+    message = next.phase === 'bidding' ? '上供还牌完成，开始新一局。' : next.tribute?.stage === 'returning' ? '供牌已随机分配，请赢家选择还牌。' : '已提交供牌，等待另一位输家。';
+  } else if (action === 'tribute-return') {
+    next = finishTribute(submitTributeReturn(game, playerId, cards, randomValues(107)));
+    message = next.phase === 'bidding' ? '还牌已随机分配，每人27张，开始新一局。' : '已提交还牌，等待另一位赢家。';
   } else if (action === 'exchange') {
-    next = exchangeBidCards(game, cards);
+    next = exchangeBidCards(game, cards, randomValues(107));
     message = '庄家已完成还牌。';
   } else if (action === 'call') {
     if (!cards[0] || cards.length !== 1) throw new Error('请选择一张叫队友的牌。');
