@@ -1,9 +1,10 @@
 import { classifyBid } from '../game/bid.js';
 import { createDeck, dealHands, shuffleCards } from '../game/deck.js';
-import { callPartner, canRespondToBid, createGameState, exchangeBidCards, passBid, playTurn, recordBid, resolveBidding, revealedBids } from '../game/engine.js';
+import { bidReturnCount, callPartner, canRespondToBid, createGameState, exchangeBidCards, passBid, playTurn, recordBid, resolveBidding, resumeAfterTribute, revealedBids } from '../game/engine.js';
 import { sortHandForDisplay } from '../game/trump.js';
-import { beginTributePhase, chooseTributeCards, preservesEverySuit, splitTeamQuota, supplyCount, teamCanAntiSupply } from '../game/tribute.js';
-import { chooseBotBid, chooseBotCalledCard, chooseBotExchange, chooseBotPlay } from './bot.js';
+import { beginInteractiveTribute, submitTributeOffer, submitTributeReturn } from '../game/tribute.js';
+import { cardFaceLabel, eventLabel, visibleEvents } from '../game/view.js';
+import { chooseBotBid, chooseBotCalledCard, chooseBotExchange, chooseBotPlay, chooseBotTribute } from './bot.js';
 import type { Card, GameState, PlayerId } from '../game/types.js';
 
 const SUITS = {
@@ -102,16 +103,6 @@ function randomValues(count: number): number[] {
   const values = new Uint32Array(count);
   crypto.getRandomValues(values);
   return Array.from(values, value => value / 0x1_0000_0000);
-}
-
-function shuffleArray<T>(items: readonly T[]): T[] {
-  const shuffled = [...items];
-  const values = randomValues(Math.max(0, shuffled.length - 1));
-  for (let index = shuffled.length - 1, step = 0; index > 0; index -= 1, step += 1) {
-    const swapIndex = Math.floor(values[step] * (index + 1));
-    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
-  }
-  return shuffled;
 }
 
 interface RoomRequestBody {
@@ -269,6 +260,11 @@ function activePlayer(): PlayerId {
   if (state.phase === 'bidding') return room?.playerId ?? state.forcedBidder ?? biddingViewer;
   return state.currentPlayer;
 }
+function viewingPlayer(): PlayerId {
+  if (room) return room.playerId;
+  if (humanCount === 1) return 0;
+  return !needsPass && isHumanPlayer(activePlayer()) ? activePlayer() : lastHumanPlayer ?? 0;
+}
 function currentHand(): readonly Card[] { return state.players[activePlayer()].hand; }
 function isBotTurn(): boolean { return !isHumanPlayer(activePlayer()); }
 
@@ -290,7 +286,7 @@ function teamLabel(id: PlayerId): string {
 function seatHtml(id: PlayerId, viewer: PlayerId): string {
   const player = state.players[id];
   const isCurrent = state.phase === 'bidding' ? canRespondToBid(state, id)
-    : id === activePlayer() && !['round-end', 'dealing', 'tribute'].includes(state.phase);
+    : id === activePlayer() && !['round-end', 'dealing'].includes(state.phase);
   const isDealer = id === state.dealer;
   const privateRole = !needsPass && id === viewer && id === state.partner && state.phase !== 'round-end' ? '你是队友' : '';
   const revealedRole = state.phase === 'round-end' ? teamLabel(id) : '';
@@ -330,9 +326,15 @@ function actionButtons(): string {
   if (state.phase === 'round-end') return roomRequestPending ? '' : !room || room.playerId === roomSnapshot?.hostId
     ? '<button class="btn primary" data-action="next">开始上供</button>'
     : '<span class="roomHint">等待房主开始上供…</span>';
-  if (state.phase === 'tribute') return roomRequestPending ? '' : !room || room.playerId === roomSnapshot?.hostId
-    ? `<button class="btn primary" data-action="continue-next">${state.tributeExchanges.length ? '上供还牌完成，开始下一局' : '无需上供，开始下一局'}</button>`
-    : '<span class="roomHint">等待房主确认上供结果…</span>';
+  if (state.phase === 'tribute') {
+    const progress = state.tribute;
+    if (!progress || progress.stage === 'complete') return !room || room.playerId === roomSnapshot?.hostId
+      ? '<button class="btn primary" data-action="continue-next">开始下一局</button>' : '';
+    if (roomRequestPending || needsPass || isBotTurn() || (room && room.playerId !== state.currentPlayer)) return '<span class="roomHint">等待当前玩家选牌确认…</span>';
+    const offering = progress.stage === 'offering';
+    const count = offering ? progress.offerCounts[state.currentPlayer] : progress.receiveCounts[state.currentPlayer];
+    return '<button class="btn primary" data-action="' + (offering ? 'tribute-offer' : 'tribute-return') + '">确认' + (offering ? '上供' : '还牌') + '（' + count + '张）</button><button class="btn" data-action="clear">清除选牌</button>';
+  }
   if (state.phase === 'bidding') {
     if (roomRequestPending || needsPass || isBotTurn()) return '';
     const player = activePlayer();
@@ -343,15 +345,20 @@ function actionButtons(): string {
   }
   if (room && (roomRequestPending || room.playerId !== state.currentPlayer)) return '';
   if (isBotTurn() || needsPass) return '';
-  if (state.phase === 'exchange') return `<button class="btn primary" data-action="exchange">确认还牌（${state.bids.find(bid => bid.player === state.pendingExchange[0])?.cardCount ?? 0}张）</button><button class="btn" data-action="clear">清除选牌</button>`;
+  if (state.phase === 'exchange') return `<button class="btn primary" data-action="exchange">确认还牌（${bidReturnCount(state)}张）</button><button class="btn" data-action="clear">清除选牌</button>`;
   if (state.phase === 'partner-call') return '<button class="btn primary" data-action="call">确认叫队友</button><button class="btn" data-action="clear">清除选牌</button>';
   if (state.phase === 'play') return '<button class="btn primary" data-action="play">出牌</button><button class="btn" data-action="clear">清除选牌</button>';
   return '';
 }
 function instruction(): string {
-  if (state.phase === 'tribute') return state.tributeExchanges.length
-    ? '上供牌和还牌已处理，请查看明细后开始下一局。'
-    : '本轮没有发生上供，请确认后开始下一局。';
+  if (state.phase === 'tribute') {
+    const progress = state.tribute;
+    if (!progress || progress.stage === 'complete') return '上供还牌完成，每人27张，可以开始下一局。';
+    const id = state.currentPlayer;
+    return progress.stage === 'offering'
+      ? playerName(id) + '请选择' + progress.offerCounts[id] + '张供牌：2、3、5或王，优先大牌，不能拆对子。所有输家提交后随机分供。'
+      : playerName(id) + '请选择' + progress.receiveCounts[id] + '张还牌。允许还主牌，不能还绝任何一门副牌；所有赢家提交后随机分还牌。';
+  }
   if (state.phase === 'bidding') {
     return state.forcedBidder !== null
       ? `四家均未叫庄，由${playerName(state.forcedBidder)}强制叫庄。`
@@ -359,7 +366,7 @@ function instruction(): string {
         ? '满供规则：上一局赢家需要等输家先叫庄，之后可以参与叫庄。'
       : `${bidRequirementLabel()}无需按座位等待，牌的点数不必更大；四家选择完成后统一比大小定庄。`;
   }
-  if (state.phase === 'exchange') return `庄家收下${playerName(state.pendingExchange[0])}的争庄牌，选择等量牌还给对方。`;
+  if (state.phase === 'exchange') return `庄家已收齐争庄牌，请一次选齐${bidReturnCount(state)}张还牌，系统按各家应得张数随机分配。不能还绝任何一门副牌。`;
   if (state.phase === 'partner-call') return '选择自己持有的一张副牌叫队友；不能叫主花色、2、3、5或大小王。';
   if (state.phase === 'play') return state.lead
     ? `首家出了 ${state.lead.cards.map(shortFace).join(' ')}。必须先跟首家副花色或主牌；没有时才能垫牌。`
@@ -379,8 +386,17 @@ function bidRequirementLabel(): string {
   return requirement.kind === 'pair' ? '本轮已锁定对子（2张）。' : `本轮已锁定${requirement.cardCount}张拖拉机。`;
 }
 function tributeSummaryHtml(): string {
-  if (!state.tributeExchanges.length) return '<div class="bidStatus">本轮不上供，确认后即可开始下一局。</div>';
-  return `<div class="tributeList">${state.tributeExchanges.map(exchange => `<div class="tributeLine"><b>${escapeHtml(playerName(exchange.from))} → ${escapeHtml(playerName(exchange.to))} · 上供</b><div class="tributeCards">${exchange.offered.map(playedCardHtml).join(' ')}</div><small>${escapeHtml(playerName(exchange.to))} → ${escapeHtml(playerName(exchange.from))} · 还牌</small><div class="tributeCards">${exchange.returned.map(playedCardHtml).join(' ')}</div></div>`).join('')}</div>`;
+  const progress = state.tribute;
+  if (!progress) return '<div class="bidStatus">换牌已完成。</div>';
+  const offering = progress.stage === 'offering';
+  const players = offering ? progress.losers : progress.winners;
+  return '<div class="bidStatus">' + players.map(id => escapeHtml(playerName(id)) + '：' + (offering ? progress.offerCounts[id] : progress.receiveCounts[id]) + '张 · ' + ((offering ? progress.offers[id] : progress.returns[id]) === null ? '待选牌' : '已提交')).join('<br>') + '<br>自己的交牌和收牌明细见牌局记录。</div>';
+}
+function gameLogHtml(): string {
+  const privateVisible = !needsPass && !needsSetup && !showNameEditor;
+  const events = privateVisible ? visibleEvents(state, viewingPlayer()) : (state.events ?? []).filter(event => event.viewer === null);
+  const lines = events.length ? [...events].reverse().map(event => eventLabel(event, playerName(event.player))) : history;
+  return lines.length ? lines.map(line => '<div class="logItem">' + escapeHtml(line) + '</div>').join('') : '<span>等待开局</span>';
 }
 function overlayHtml(): string {
   if (needsSetup && roomFormMode) {
@@ -398,7 +414,7 @@ function overlayHtml(): string {
       : Array.from({ length: humanCount }, (_, index) => `<label class="nameField"><span>玩家${index + 1}昵称</span><input maxlength="16" data-edit-name="${index}" value="${escapeHtml(draftNames[index])}" placeholder="玩家${index + 1}"></label>`).join('');
     return `<div class="overlay"><div class="dialog setupDialog"><h2>修改玩家昵称</h2><p>人机名称按座位自动编号。</p><div class="nameFields">${names}</div>${modalError ? `<p class="formError">${escapeHtml(modalError)}</p>` : ''}<div class="dialogActions"><button class="btn primary" data-action="save-names">保存昵称</button><button class="btn" data-action="cancel-names">取消</button></div></div></div>`;
   }
-  if (room || !needsPass || ['dealing', 'round-end', 'tribute'].includes(state.phase)) return '';
+  if (room || !needsPass || ['dealing', 'round-end'].includes(state.phase)) return '';
   return `<div class="overlay"><div class="dialog"><h2>请交给${escapeHtml(playerName(activePlayer()))}</h2><p>轮到当前玩家查看手牌。请确认其他人看不到屏幕后继续。</p><button class="btn primary" data-action="reveal">我已接手</button></div></div>`;
 }
 
@@ -426,26 +442,20 @@ function render(): void {
     humanCount = 4;
     humanNames = roomSnapshot.players.map(player => player.name);
   }
-  const viewer = activePlayer();
+  const viewer = viewingPlayer();
   const suit = state.trumpSuit;
   const hand = sortHandForDisplay(room ? state.players[room.playerId].hand : currentHand(), suit);
   const handVisible = room
-    ? !showNameEditor && !['dealing', 'round-end', 'tribute'].includes(state.phase)
-    : !needsSetup && !showNameEditor && !needsPass && !isBotTurn() && !['dealing', 'round-end', 'tribute'].includes(state.phase);
+    ? !showNameEditor && !['dealing', 'round-end'].includes(state.phase)
+    : !needsSetup && !showNameEditor && !needsPass && !isBotTurn() && !['dealing', 'round-end'].includes(state.phase);
   const trump = suit ? SUITS[suit] : null;
   const revealedPoints = state.currentTrick.flatMap(play => play.cards).reduce((sum, card) => sum + pointsFor(card), 0);
-  const handTitle = state.phase === 'tribute'
-    ? '上供还牌结果'
-    : room && room.playerId !== viewer ? `我的手牌：${playerName(room.playerId)}` : `当前操作：${playerName(viewer)}`;
-  const handStatus = state.phase === 'tribute'
-    ? '手牌保密'
-    : handVisible ? `${hand.length}张 · 已选${selected.length}张` : '手牌轮到当前玩家时显示';
-  const hiddenHandHint = state.phase === 'tribute'
-    ? '请查看右侧上供与还牌明细'
-    : room ? '本局尚未发牌' : isBotTurn() ? `${playerName(viewer)}思考中…` : '手牌暂时隐藏';
+  const handTitle = '我的手牌：' + playerName(viewer);
+  const handStatus = handVisible ? hand.length + '张 · 已选' + selected.length + '张' : '手牌暂时隐藏';
+  const hiddenHandHint = room ? '本局尚未发牌' : isBotTurn() ? playerName(activePlayer()) + '思考中…' : '请交接设备后查看自己的牌';
   const roomControls = room ? `<span class="chip">房间 <strong>${escapeHtml(room.code)}</strong></span><button class="btn" data-action="copy-room">复制邀请链接</button><button class="btn" data-action="edit-names">修改昵称</button>` : `<button class="btn" data-action="edit-names">修改昵称</button><button class="btn" data-action="new">新开一局</button>`;
   app.innerHTML = `<header><div class="brand"><div class="mark">♣</div><div><h1>新疆双扣</h1><div class="sub">${room ? '四人房间 · 服务端同步' : '单机人机 · 本地多人 · 联机房间'}</div></div></div><div class="top">${roomControls}</div></header>
-    <div class="chips"><span class="chip"><strong>${stageLabel()}</strong></span>${state.dealer !== null ? `<span class="chip">庄家 <strong>${escapeHtml(playerName(state.dealer))}</strong></span>` : ''}${trump ? `<span class="chip">主花色 <strong>${trump.symbol} ${trump.name}</strong></span>` : ''}<span class="chip">已打 <strong>${state.trickCount}</strong>墩</span></div>
+    <div class="chips"><span class="chip"><strong>${stageLabel()}</strong></span>${state.dealer !== null ? `<span class="chip">庄家 <strong>${escapeHtml(playerName(state.dealer))}</strong></span>` : ''}${trump ? `<span class="chip">主花色 <strong>${trump.symbol} ${trump.name}</strong></span>` : ''}${state.calledCard ? `<span class="chip">叫队友牌 <strong>${cardFaceLabel(state.calledCard)}</strong></span>` : ''}<span class="chip">已打 <strong>${state.trickCount}</strong>墩</span></div>
     <div class="layout"><main class="table"><div class="seats">${[0, 1, 2, 3].map(id => seatHtml(id as PlayerId, viewer)).join('')}
       <div class="center"><div class="centerLabel">${state.phase === 'play' ? '本墩出牌' : '牌桌'}</div><div class="plays">${trickHtml()}</div></div></div>
       <div class="notice">${escapeHtml(notice || instruction())}</div>
@@ -454,7 +464,7 @@ function render(): void {
       <div class="footerNote">双副牌108张；5计5分，10和K各计10分。牌面顺序会在确定主花色后自动整理。</div></main>
       <aside class="side"><section><div class="scores"><div class="score"><div class="scoreLabel">庄家队</div><div class="scoreValue">${state.scores[0]}</div></div><div class="score"><div class="scoreLabel">闲家队</div><div class="scoreValue">${state.scores[1]}</div></div></div></section>
       ${state.phase === 'tribute' ? `<section><h2>上供与还牌</h2>${tributeSummaryHtml()}</section>` : ''}
-      <section><h2>争庄</h2>${bidStatusHtml()}</section><section><h2>牌局提示</h2><div class="bidStatus">${escapeHtml(instruction())}${state.currentTrick.length ? `<br><br>本墩分牌：${revealedPoints}分` : ''}</div></section><section><h2>牌局记录</h2><div class="log">${history.length ? history.map(item => `<div class="logItem">${escapeHtml(item)}</div>`).join('') : '<span>等待开局</span>'}</div></section></aside></div>${overlayHtml()}`;
+      <section><h2>争庄</h2>${bidStatusHtml()}</section><section><h2>牌局提示</h2><div class="bidStatus">${escapeHtml(instruction())}${state.currentTrick.length ? `<br><br>本墩分牌：${revealedPoints}分` : ''}</div></section><section><h2>牌局记录</h2><div class="log">${gameLogHtml()}</div></section></aside></div>${overlayHtml()}`;
 }
 
 function selectedCards(): readonly Card[] {
@@ -499,9 +509,16 @@ function finishBidResponse(next: GameState, player: PlayerId, message: string): 
   setState(next, message, needsPass || nextViewer !== oldViewer, preserveSelection);
 }
 function doExchange(returned: readonly Card[] = selectedCards()): void {
-  const loser = state.pendingExchange[0];
-  const next = exchangeBidCards(state, returned);
-  setState(next, loser === undefined ? '换牌完成。' : `庄家已向${playerName(loser)}还牌。`, false);
+  const next = exchangeBidCards(state, returned, randomValues(107));
+  setState(next, '庄家已一次性还牌，系统已随机分配。', false);
+}
+function doTribute(cards: readonly Card[] = selectedCards()): void {
+  let next = state.tribute?.stage === 'offering'
+    ? submitTributeOffer(state, activePlayer(), cards, randomValues(107))
+    : submitTributeReturn(state, activePlayer(), cards, randomValues(107));
+  const complete = next.tribute?.stage === 'complete';
+  if (complete) next = resumeAfterTribute(next);
+  setState(next, complete ? '还牌已随机分配，每人27张，开始新一局。' : next.tribute?.stage === 'returning' ? '供牌已随机分配，等待赢家选择还牌。' : '供牌已提交，等待另一位输家。', true);
 }
 function doCallPartner(called: Card | undefined = selectedCards()[0]): void {
   if (!called) throw new Error('请选择一张叫队友的牌。');
@@ -520,6 +537,7 @@ function doPlay(cards: readonly Card[] = selectedCards()): void {
 
 function runBotTurn(): void {
   if (!isBotTurn()) return;
+  if (state.phase === 'tribute') { doTribute(chooseBotTribute(state)); return; }
   if (state.phase === 'exchange') { doExchange(chooseBotExchange(state)); return; }
   if (state.phase === 'partner-call') { doCallPartner(chooseBotCalledCard(state)); return; }
   if (state.phase === 'play') { doPlay(chooseBotPlay(state)); }
@@ -531,7 +549,8 @@ function scheduleBotTurn(): void {
     return;
   }
   clearBotBids();
-  if (needsSetup || showNameEditor || needsPass || !isBotTurn() || ['dealing', 'round-end', 'tribute'].includes(state.phase) || botTimer !== null) return;
+  if (state.phase === 'tribute' && (!state.tribute || state.tribute.stage === 'complete')) return;
+  if (needsSetup || showNameEditor || needsPass || !isBotTurn() || ['dealing', 'round-end'].includes(state.phase) || botTimer !== null) return;
   notice = `${playerName(activePlayer())}思考中…`;
   render();
   botTimer = window.setTimeout(() => {
@@ -578,88 +597,15 @@ function restart(): void {
   setState(createGameState(deal(), previousDealer), '新一局已发牌。', true);
 }
 function startNextRound(): void {
-  if (state.winnerTeam === null || state.dealer === null || state.partner === null || state.trumpSuit === null) {
-    const previousDealer = state.dealer ?? state.previousDealer;
-    const freshState = createGameState(deal(), previousDealer);
-    setState(beginTributePhase({ ...state, fullSupply: false, previousLosingTeam: null }, freshState.players, []), '本轮无需上供，请查看牌桌提示后开始下一局。', false);
-    return;
-  }
-  const previousDealer = state.dealer;
-  const winningTeam: readonly [PlayerId, PlayerId] = state.winnerTeam === 0
-    ? [state.dealer, state.partner]
-    : [([0, 1, 2, 3] as const).filter(id => id !== state.dealer && id !== state.partner)[0], ([0, 1, 2, 3] as const).filter(id => id !== state.dealer && id !== state.partner)[1]];
-  const losingTeam: readonly [PlayerId, PlayerId] = state.winnerTeam === 0
-    ? [([0, 1, 2, 3] as const).filter(id => id !== state.dealer && id !== state.partner)[0], ([0, 1, 2, 3] as const).filter(id => id !== state.dealer && id !== state.partner)[1]]
-    : [state.dealer, state.partner];
-  const net = Math.abs(state.scores[0] - state.scores[1]);
-  const requested = supplyCount(net);
-  const newHands = deal();
-  const temporaryPlayers: GameState['players'] = [
-    { id: 0, hand: newHands[0] }, { id: 1, hand: newHands[1] },
-    { id: 2, hand: newHands[2] }, { id: 3, hand: newHands[3] }
-  ];
-  let dealState: GameState = { ...state, phase: 'dealing', players: temporaryPlayers };
-  let noticeText = requested === 0 ? '净胜不足20分，本轮不上供。' : `按净胜分计算上${requested}供。`;
-  const antiSupply = requested === 8 && teamCanAntiSupply(dealState, losingTeam, state.trumpSuit);
-  const fullSupply = requested === 8 && !antiSupply;
-  let tributeExchanges: GameState['tributeExchanges'] = [];
-  if (antiSupply) {
-    noticeText = '输家成功抗满供，本轮不上供。';
-  } else if (requested > 0) {
-    const quotas = splitTeamQuota(requested, losingTeam, previousDealer);
-    const offers = new Map<PlayerId, readonly Card[]>([
-      [losingTeam[0], chooseTributeCards(dealState.players[losingTeam[0]].hand, quotas[0], state.trumpSuit)],
-      [losingTeam[1], chooseTributeCards(dealState.players[losingTeam[1]].hand, quotas[1], state.trumpSuit)]
-    ]);
-    const slots = shuffleArray(losingTeam.flatMap(loser => (offers.get(loser) ?? []).map(card => ({ loser, card }))));
-    const actual = slots.length;
-    if (actual > 0) {
-      const winners = splitTeamQuota(actual, winningTeam, previousDealer);
-      const winnerSlots = new Map<PlayerId, typeof slots>([[winningTeam[0], []], [winningTeam[1], []]]);
-      let cursor = 0;
-      for (const winner of winningTeam) {
-        const quota = winner === winningTeam[0] ? winners[0] : winners[1];
-        winnerSlots.set(winner, slots.slice(cursor, cursor + quota));
-        cursor += quota;
-      }
-      const exchanges = new Map<string, { from: PlayerId; to: PlayerId; offered: Card[]; returned: Card[] }>();
-      for (const winner of winningTeam) {
-        const received = winnerSlots.get(winner) ?? [];
-        const returned = randomReturnCards(dealState.players[winner].hand, received.length);
-        received.forEach((slot, index) => {
-          const key = `${slot.loser}:${winner}`;
-          const exchange = exchanges.get(key) ?? { from: slot.loser, to: winner, offered: [], returned: [] };
-          exchange.offered.push(slot.card);
-          exchange.returned.push(returned[index]);
-          exchanges.set(key, exchange);
-        });
-      }
-      tributeExchanges = [...exchanges.values()];
-      noticeText = `已完成${actual}供：输家按规定上牌，赢家分供并还牌。请查看明细。`;
-    } else {
-      noticeText = '输家没有足够的合格主牌，本轮未能上供。';
-    }
-  }
-  const tributeState = beginTributePhase(
-    { ...state, fullSupply, previousLosingTeam: fullSupply ? losingTeam : null },
-    temporaryPlayers,
-    tributeExchanges
-  );
-  setState(tributeState, noticeText, false);
+  const dealtPlayers = createGameState(deal(), state.dealer ?? state.previousDealer).players;
+  let next = beginInteractiveTribute(state, dealtPlayers);
+  const complete = next.tribute?.stage === 'complete';
+  if (complete) next = resumeAfterTribute(next);
+  setState(next, complete ? '本轮无需上供，开始新一局。' : '新牌已发，请输家自行选择供牌并确认。', true);
 }
 
 function continueAfterTribute(): void {
-  if (state.phase !== 'tribute') throw new Error('当前没有待确认的上供结果。');
-  const previousDealer = state.dealer ?? state.previousDealer;
-  const hands: ReturnType<typeof dealHands> = [
-    state.players[0].hand, state.players[1].hand,
-    state.players[2].hand, state.players[3].hand
-  ];
-  const message = state.tributeExchanges.length ? '上供还牌完成，新一局已发牌。' : '本轮无需上供，新一局已发牌。';
-  setState(createGameState(hands, previousDealer, {
-    fullSupply: state.fullSupply,
-    previousLosingTeam: state.previousLosingTeam
-  }), message, true);
+  setState(resumeAfterTribute(state), '上供还牌完成，开始新一局。', true);
 }
 
 function startLocalGame(): void {
@@ -734,14 +680,6 @@ async function copyRoomLink(): Promise<void> {
   render();
 }
 
-function randomReturnCards(hand: readonly Card[], count: number): readonly Card[] {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    const shuffled = shuffleCards(hand, randomValues(Math.max(0, hand.length - 1)));
-    const candidate = shuffled.slice(0, count);
-    if (preservesEverySuit(hand, candidate)) return candidate;
-  }
-  throw new Error('无法随机选出符合花色保留规则的还牌。');
-}
 async function runAction(action: string): Promise<void> {
   try {
     if (action === 'create-room') { roomFormMode = 'create'; roomNameInput = humanNames[0]; modalError = ''; render(); return; }
@@ -758,13 +696,14 @@ async function runAction(action: string): Promise<void> {
     if (action === 'edit-names') { draftNames = [...humanNames]; modalError = ''; showNameEditor = true; render(); return; }
     if (action === 'save-names') { await saveNames(); return; }
     if (action === 'cancel-names') { showNameEditor = false; modalError = ''; render(); return; }
-    if (room && ['bid', 'pass', 'exchange', 'call', 'play', 'redeal', 'next', 'continue-next'].includes(action)) {
+    if (room && ['bid', 'pass', 'exchange', 'tribute-offer', 'tribute-return', 'call', 'play', 'redeal', 'next', 'continue-next'].includes(action)) {
       await submitRoomAction(action);
       return;
     }
     if (action === 'bid') { submitBid(); return; }
     if (action === 'pass') { submitPass(); return; }
     if (action === 'exchange') { doExchange(); return; }
+    if (action === 'tribute-offer' || action === 'tribute-return') { doTribute(); return; }
     if (action === 'call') { doCallPartner(); return; }
     if (action === 'play') { doPlay(); return; }
     if (action === 'redeal') { restart(); return; }

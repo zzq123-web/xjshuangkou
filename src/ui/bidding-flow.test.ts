@@ -1,5 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Card } from '../game/types.js';
+import { createDeck, dealHands } from '../game/deck.js';
+import { chooseTributeCards } from '../game/tribute.js';
+import { chooseBotReturn } from './bot.js';
+
+const scenario = vi.hoisted(() => ({ mode: 'bidding' }));
+vi.mock('../game/engine.js', async importOriginal => {
+  const engine = await importOriginal<typeof import('../game/engine.js')>();
+  const create: typeof engine.createGameState = (hands, dealer, priorRules) => {
+    const state = engine.createGameState(hands, dealer, priorRules);
+    if (scenario.mode === 'tribute-winner' || scenario.mode === 'tribute-loser') return {
+      ...state, phase: 'round-end', dealer: 0, partner: 2, trumpSuit: 'clubs',
+      winnerTeam: scenario.mode === 'tribute-winner' ? 0 : 1, scores: [140, 60]
+    };
+    if (scenario.mode === 'called') return { ...state, phase: 'play', dealer: 0, partner: 1, trumpSuit: 'clubs', calledCard: { suit: 'spades', rank: 'A' } };
+    return state;
+  };
+  return { ...engine, createGameState: create };
+});
 
 vi.mock('../game/deck.js', async importOriginal => {
   const deck = await importOriginal<typeof import('../game/deck.js')>();
@@ -29,6 +47,7 @@ function click(dataset: Record<string, string>): void {
 }
 
 beforeEach(() => {
+  scenario.mode = 'bidding';
   vi.resetModules();
   vi.useFakeTimers();
   app.innerHTML = '';
@@ -89,4 +108,76 @@ describe('local bidding race', () => {
     expect(app.innerHTML).toContain('玩家1成为庄家');
     expect(app.innerHTML).not.toContain('The bid must match');
   });
+});
+
+describe('interactive tribute UI and records', () => {
+  it('waits for the human loser to choose and submit their tribute', async () => {
+    scenario.mode = 'tribute-loser';
+    await import('./main.js');
+    click({ action: 'start-local' });
+    click({ action: 'next' });
+    expect(app.innerHTML).toContain('确认上供（2张）');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(app.innerHTML).toContain('确认上供（2张）');
+    const offered = chooseTributeCards(dealHands(createDeck())[0], 2, 'clubs');
+    for (const card of offered) click({ card: card.id });
+    click({ action: 'tribute-offer' });
+    await vi.advanceTimersByTimeAsync(1800);
+    expect(app.innerHTML).toContain('玩家1上供：');
+    expect(app.innerHTML).toContain('玩家1收到还牌：');
+    expect(app.innerHTML).not.toContain('人机1收到供牌：');
+    expect(app.innerHTML).not.toContain('人机2上供：');
+    expect(app.innerHTML).not.toContain('人机3还牌：');
+    expect(app.innerHTML).toContain('抢庄');
+  });
+
+  it('waits for the human winner to select returns after receiving tribute', async () => {
+    scenario.mode = 'tribute-winner';
+    await import('./main.js');
+    click({ action: 'start-local' });
+    click({ action: 'next' });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(app.innerHTML).toContain('确认还牌（2张）');
+    expect(app.innerHTML).toContain('29张 · 已选0张');
+    expect(app.innerHTML).toContain('玩家1收到供牌：');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(app.innerHTML).toContain('确认还牌（2张）');
+    const ids = [...app.innerHTML.matchAll(/data-card="([^"]+)"/g)].map(match => match[1]);
+    const hand = createDeck().filter(card => ids.includes(card.id));
+    const returned = chooseBotReturn(hand, 2, 'clubs');
+    for (const card of returned) click({ card: card.id });
+    click({ action: 'tribute-return' });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(app.innerHTML).toContain('玩家1还牌：');
+    expect(app.innerHTML).toContain('27张 · 已选0张');
+    expect(app.innerHTML).not.toContain('人机2收到供牌：');
+  });
+
+  it('shows the called card in the header and records actual public card faces', async () => {
+    scenario.mode = 'called';
+    await import('./main.js');
+    click({ action: 'start-local' });
+    expect(app.innerHTML).toContain('叫队友牌 <strong>♠A</strong>');
+    click({ card: 'clubs-4-1' });
+    click({ action: 'play' });
+    expect(app.innerHTML).toContain('玩家1出牌：♣4');
+  });
+});
+
+it('asks the human dealer for one complete six-card return and keeps recipient records private', async () => {
+  await import('./main.js');
+  click({ action: 'start-local' });
+  click({ card: 'clubs-K-1' });
+  click({ card: 'clubs-K-2' });
+  click({ action: 'bid' });
+  await vi.advanceTimersByTimeAsync(8000);
+  expect(app.innerHTML).toContain('确认还牌（6张）');
+  expect(app.innerHTML).toContain('33张 · 已选0张');
+  const ids = [...app.innerHTML.matchAll(/data-card="([^"]+)"/g)].map(match => match[1]);
+  const hand = createDeck().filter(card => ids.includes(card.id));
+  for (const card of chooseBotReturn(hand, 6, 'clubs')) click({ card: card.id });
+  click({ action: 'exchange' });
+  expect(app.innerHTML).toContain('确认叫队友');
+  expect(app.innerHTML).toContain('玩家1争庄还牌：');
+  expect(app.innerHTML).not.toContain('人机1争庄收到牌：');
 });
