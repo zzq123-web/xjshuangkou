@@ -136,7 +136,20 @@ describe('play rules', () => {
       card('hearts', '2', 1), card('hearts', '2', 2)
     ];
     expect(classifyPlay(mainTractor, 'hearts').mainTrump).toBe(true);
-    expect(classifyPlay(specialTractor, 'hearts').mainTrump).toBe(false);
+    expect(classifyPlay(specialTractor, 'hearts').mainTrump).toBe(true);
+  });
+
+  it('treats a 2233 tractor in a side suit as a trump lead', () => {
+    const lead: Play = {
+      player: 0,
+      cards: [card('spades', '2', 1), card('spades', '2', 2), card('spades', '3', 1), card('spades', '3', 2)]
+    };
+    const hand = [
+      card('hearts', 'A'), card('hearts', 'K'),
+      card('spades', 'A'), card('diamonds', 'A')
+    ];
+    expect(validateFollow(hand, [hand[2], hand[3]], lead, 'hearts').legal).toBe(false);
+    expect(validateFollow(hand, [hand[0], hand[1], hand[2], hand[3]], lead, 'hearts').legal).toBe(true);
   });
 
   it('requires a player to follow the led side suit when held', () => {

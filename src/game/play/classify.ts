@@ -1,5 +1,5 @@
 import { tractorStart } from '../bid.js';
-import { isTrump, isSpecialTrumpRank } from '../trump.js';
+import { isTrump } from '../trump.js';
 import type { Card, ClassifiedPlay, Suit } from '../types.js';
 
 export function classifyPlay(cards: readonly Card[], trumpSuit: Suit): ClassifiedPlay {
@@ -12,7 +12,7 @@ export function classifyPlay(cards: readonly Card[], trumpSuit: Suit): Classifie
   }
   const start = tractorStart(cards);
   if (start !== null) {
-    const mainTrump = cards[0].suit === trumpSuit && !cards.some(card => isSpecialTrumpRank(card.rank));
+    const mainTrump = cards.every(card => isTrump(card, trumpSuit));
     return { kind: 'tractor', suit: cards[0].suit, mainTrump, tractorStart: start, cardCount: cards.length };
   }
   return { kind: 'other', suit: null, mainTrump: false, tractorStart: null, cardCount: cards.length };
