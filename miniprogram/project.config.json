@@ -1,0 +1,17 @@
+{
+  "description": "新疆双扣微信小程序",
+  "packOptions": {
+    "ignore": []
+  },
+  "setting": {
+    "urlCheck": true,
+    "es6": true,
+    "postcss": true,
+    "minified": false
+  },
+  "compileType": "miniprogram",
+  "appid": "wx2fe224c1164e9075",
+  "projectname": "xinjiang-shuangkou",
+  "libVersion": "3.7.0",
+  "condition": {}
+}
