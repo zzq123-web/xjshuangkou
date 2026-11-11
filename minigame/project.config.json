@@ -1,0 +1,15 @@
+{
+  "description": "新疆双扣微信小游戏",
+  "packOptions": {
+    "ignore": []
+  },
+  "setting": {
+    "urlCheck": true,
+    "es6": true,
+    "minified": false
+  },
+  "compileType": "game",
+  "appid": "touristappid",
+  "projectname": "xinjiang-shuangkou-minigame",
+  "condition": {}
+}

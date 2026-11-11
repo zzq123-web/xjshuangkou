@@ -1,0 +1,12 @@
+{
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "新疆双扣",
+    "navigationBarBackgroundColor": "#0c2d25",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#f5f1e8"
+  },
+  "sitemapLocation": "sitemap.json"
+}
