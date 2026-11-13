@@ -109,6 +109,7 @@ function randomValues(count        )           {
                          
                            
                                        
+                          
  
 
 const ROOM_API_ORIGIN = window.location.hostname === 'zzq123-web.github.io'
@@ -116,10 +117,14 @@ const ROOM_API_ORIGIN = window.location.hostname === 'zzq123-web.github.io'
   : '';
 
 async function roomRequest   (path        , body                  , token                            = room?.token)             {
-  const headers = new Headers();
-  if (body) headers.set('content-type', 'application/json');
-  if (token) headers.set('x-room-token', token);
-  const response = await fetch(`${ROOM_API_ORIGIN}${path}`, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined });
+  const requestUrl = new URL(path, ROOM_API_ORIGIN || window.location.origin);
+  const requestBody = body || token ? { ...body, ...(token ? { token } : {}) } : undefined;
+  const headers = requestBody ? { 'content-type': 'text/plain;charset=UTF-8' } : undefined;
+  const response = await fetch(ROOM_API_ORIGIN ? requestUrl.toString() : `${requestUrl.pathname}${requestUrl.search}`, {
+    method: requestBody ? 'POST' : 'GET',
+    headers,
+    body: requestBody ? JSON.stringify(requestBody) : undefined
+  });
   const result          = await response.json();
   if (!response.ok) {
     const errorMessage = typeof result === 'object' && result !== null && 'error' in result && typeof result.error === 'string'
