@@ -112,7 +112,7 @@ function randomValues(count        )           {
  
 
 const ROOM_API_ORIGIN = window.location.hostname === 'zzq123-web.github.io'
-  ? 'https://xinjiang-shuangkou-game.authenticauk1.chatgpt.site'
+  ? 'https://xinjiang-shuangkou-online.grownpecan1.chatgpt.site'
   : '';
 
 async function roomRequest   (path        , body                  , token                            = room?.token)             {
@@ -424,13 +424,14 @@ function overlayHtml()         {
 
 function renderRoomLobby()       {
   if (!room || !roomSnapshot) return;
+  const inviteUrl = currentRoomInviteUrl();
   const hostId = roomSnapshot.hostId;
   const readyCount = roomSnapshot.players.filter(player => player.ready).length;
   const seats = roomSnapshot.players.map((player, index) => `<div class="roomSeat ${player.ready ? 'ready' : ''}"><div><b>${['东家', '南家', '西家', '北家'][index]}</b>${index === hostId ? '<small>房主</small>' : ''}</div><span>${escapeHtml(player.ready ? player.name : '等待加入')}</span></div>`).join('');
   const startButton = room.playerId === roomSnapshot.hostId
     ? `<button class="btn primary" data-action="start-room" ${readyCount < 4 ? 'disabled' : ''}>${readyCount < 4 ? `等待玩家加入（${readyCount}/4）` : '四人到齐，开始游戏'}</button>`
     : '<p class="roomHint">等待房主开始游戏…</p>';
-  app.innerHTML = `<header><div class="brand"><div class="mark">♣</div><div><h1>新疆双扣</h1><div class="sub">四人联机房间</div></div></div><div class="top"><button class="btn" data-action="copy-room">复制邀请链接</button><button class="btn" data-action="edit-names">修改昵称</button><button class="btn" data-action="leave-room">离开房间</button></div></header><main class="roomLobby"><span class="eyebrow">ROOM LOBBY</span><h2>等待玩家加入</h2><p>把房间号或邀请链接发给其他玩家，手机和电脑都可以加入。</p><div class="roomCode">${escapeHtml(roomSnapshot.code)}</div><label class="inviteField"><span>邀请链接</span><input readonly value="${escapeHtml(roomSnapshot.inviteUrl)}" aria-label="邀请链接"></label><div class="roomSeats">${seats}</div><div class="roomActions">${startButton}</div><p class="roomHint">房间 ${escapeHtml(roomSnapshot.code)} · 你是${room.playerId === roomSnapshot.hostId ? '房主' : `${room.playerId + 1}号玩家`}</p><p class="roomHint">${escapeHtml(notice || roomSnapshot.message)}</p></main>${overlayHtml()}`;
+  app.innerHTML = `<header><div class="brand"><div class="mark">♣</div><div><h1>新疆双扣</h1><div class="sub">四人联机房间</div></div></div><div class="top"><button class="btn" data-action="copy-room">复制邀请链接</button><button class="btn" data-action="edit-names">修改昵称</button><button class="btn" data-action="leave-room">离开房间</button></div></header><main class="roomLobby"><span class="eyebrow">ROOM LOBBY</span><h2>等待玩家加入</h2><p>把房间号或邀请链接发给其他玩家，手机和电脑都可以加入。</p><div class="roomCode">${escapeHtml(roomSnapshot.code)}</div><label class="inviteField"><span>邀请链接</span><input readonly value="${escapeHtml(inviteUrl)}" aria-label="邀请链接"></label><div class="roomSeats">${seats}</div><div class="roomActions">${startButton}</div><p class="roomHint">房间 ${escapeHtml(roomSnapshot.code)} · 你是${room.playerId === roomSnapshot.hostId ? '房主' : `${room.playerId + 1}号玩家`}</p><p class="roomHint">${escapeHtml(notice || roomSnapshot.message)}</p></main>${overlayHtml()}`;
 }
 function render()       {
   if (room) {
@@ -673,13 +674,20 @@ async function leaveRoom()                {
   render();
 }
 
+function currentRoomInviteUrl()         {
+  const invite = new URL(window.location.href);
+  invite.searchParams.set('room', roomSnapshot?.code ?? '');
+  return invite.toString();
+}
+
 async function copyRoomLink()                {
   if (!roomSnapshot) return;
+  const inviteUrl = currentRoomInviteUrl();
   try {
-    await navigator.clipboard.writeText(roomSnapshot.inviteUrl);
+    await navigator.clipboard.writeText(inviteUrl);
     notice = '邀请链接已复制。';
   } catch {
-    notice = `邀请链接：${roomSnapshot.inviteUrl}`;
+    notice = `邀请链接：${inviteUrl}`;
   }
   render();
 }
