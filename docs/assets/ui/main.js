@@ -109,7 +109,6 @@ function randomValues(count        )           {
                          
                            
                                        
-                          
  
 
 const ROOM_API_ORIGIN = window.location.hostname === 'zzq123-web.github.io'
@@ -118,8 +117,11 @@ const ROOM_API_ORIGIN = window.location.hostname === 'zzq123-web.github.io'
 
 async function roomRequest   (path        , body                  , token                            = room?.token)             {
   const requestUrl = new URL(path, ROOM_API_ORIGIN || window.location.origin);
-  const requestBody = body || token ? { ...body, ...(token ? { token } : {}) } : undefined;
-  const headers = requestBody ? { 'content-type': 'text/plain;charset=UTF-8' } : undefined;
+  const requestBody = body ?? (token ? {} : undefined);
+  const headers = requestBody ? {
+    'content-type': 'text/plain;charset=UTF-8',
+    ...(token ? { 'x-room-token': token } : {})
+  } : undefined;
   const response = await fetch(ROOM_API_ORIGIN ? requestUrl.toString() : `${requestUrl.pathname}${requestUrl.search}`, {
     method: requestBody ? 'POST' : 'GET',
     headers,
